@@ -1,0 +1,112 @@
+name: SA22 L04 PR5 frozen-head trial
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: sa22-l04-pr5-single-trial
+  cancel-in-progress: false
+env:
+  APPROVED_WORKFLOW_SHA: ${{ vars.SA22_APPROVED_WORKFLOW_SHA }}
+  WORKFLOW_SHA: ${{ github.workflow_sha }}
+  TARGET_REPO: Loz888/MAGR-v3
+  TARGET_PR: '5'
+  EXPECTED_HEAD: 007edb9cd2c2f7b07cdaaa4ec91c4a97cd7fd3af
+  EXPECTED_BASE: 6669b7d189aa439bd23334d9b59739f8b48f4406
+  EXPECTED_CI_REPO: Loz888/magr-sa22-l04-ci
+  CHECK_NAME: SA22 L04 PR5 frozen-head trial
+  EXTERNAL_ID: sa22-l04-task-02f05cdc-3450-4828-be1c-42504afbd296
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      result: ${{ steps.test.outputs.result }}
+    steps:
+      - name: Validate invocation and PR
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == "$EXPECTED_CI_REPO" && "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REF" == refs/heads/main && "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ && "$GITHUB_RUN_ATTEMPT" == 1 ]]
+          [[ "$APPROVED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ && "$WORKFLOW_SHA" == "$APPROVED_WORKFLOW_SHA" && "$GITHUB_SHA" == "$APPROVED_WORKFLOW_SHA" ]]
+          pr=$(curl --retry 0 -fsS -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$TARGET_REPO/pulls/$TARGET_PR")
+          jq -e --arg h "$EXPECTED_HEAD" --arg b "$EXPECTED_BASE" --arg r "$TARGET_REPO" '.state == "open" and .head.sha == $h and .base.sha == $b and .head.repo.full_name == $r and .base.repo.full_name == $r' <<<"$pr" >/dev/null
+      - name: Checkout frozen head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: Loz888/MAGR-v3
+          ref: 007edb9cd2c2f7b07cdaaa4ec91c4a97cd7fd3af
+          persist-credentials: false
+      - name: Verify checkout and download pinned test image
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD"
+          docker pull golang@sha256:8d48e12ec56735e9358640898b9d9b9fcca110612ed8a5567438c0a1baa24e66
+      - name: Run tests in restricted container
+        id: test
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="sa22-l04-${GITHUB_RUN_ID}"
+          trap 'docker rm -f "$name" >/dev/null 2>&1 || true' EXIT
+          marker=$(openssl rand -hex 24)
+          printf "::stop-commands::%s\n" "$marker"
+          set +e
+          timeout --signal=TERM --kill-after=5s 180s docker run --name "$name" --rm \
+            --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+            --pids-limit 128 --memory 1g --cpus 2 --user 65534:65534 \
+            --tmpfs /tmp:rw,nosuid,nodev,exec,size=512m \
+            -e HOME=/tmp -e GOCACHE=/tmp/gocache -e GOPATH=/tmp/gopath \
+            -e GOTOOLCHAIN=local -e GOPROXY=off \
+            -v "$GITHUB_WORKSPACE:/work:ro" -w /work/v3/examples/repair-target \
+            golang@sha256:8d48e12ec56735e9358640898b9d9b9fcca110612ed8a5567438c0a1baa24e66 \
+            go test -count=1 ./...
+          rc=$?
+          set -e
+          printf "::%s::\n" "$marker"
+          case "$rc" in
+            0) result=success ;;
+            1) result=failure ;;
+            124) result=timed_out ;;
+            *) result=infrastructure_error ;;
+          esac
+          printf 'result=%s\n' "$result" >> "$GITHUB_OUTPUT"
+          test "$result" = success
+  report:
+    needs: test
+    if: ${{ always() && (needs.test.outputs.result == 'success' || needs.test.outputs.result == 'failure' || needs.test.outputs.result == 'timed_out') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Validate invocation and current PR
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == "$EXPECTED_CI_REPO" && "$GITHUB_EVENT_NAME" == workflow_dispatch && "$GITHUB_REF" == refs/heads/main && "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ && "$GITHUB_RUN_ATTEMPT" == 1 ]]
+          [[ "$APPROVED_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ && "$WORKFLOW_SHA" == "$APPROVED_WORKFLOW_SHA" && "$GITHUB_SHA" == "$APPROVED_WORKFLOW_SHA" ]]
+          pr=$(curl --retry 0 -fsS -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$TARGET_REPO/pulls/$TARGET_PR")
+          jq -e --arg h "$EXPECTED_HEAD" --arg b "$EXPECTED_BASE" --arg r "$TARGET_REPO" '.state == "open" and .head.sha == $h and .base.sha == $b and .head.repo.full_name == $r and .base.repo.full_name == $r' <<<"$pr" >/dev/null
+      - name: Generate scoped CI App token
+        id: app
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        with:
+          app-id: ${{ secrets.SA22_CI_APP_ID }}
+          private-key: ${{ secrets.SA22_CI_APP_PRIVATE_KEY }}
+          owner: Loz888
+          repositories: MAGR-v3
+      - name: Reject existing result and publish once
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          CI_APP_ID: ${{ secrets.SA22_CI_APP_ID }}
+          RESULT: ${{ needs.test.outputs.result }}
+        run: |
+          set -euo pipefail
+          [[ "$CI_APP_ID" =~ ^[1-9][0-9]*$ ]]
+          case "$RESULT" in success|failure|timed_out) ;; *) exit 1;; esac
+          existing=$(gh api --paginate "repos/$TARGET_REPO/commits/$EXPECTED_HEAD/check-runs?filter=all&per_page=100" | jq -s --arg name "$CHECK_NAME" --arg ext "$EXTERNAL_ID" --arg app "$CI_APP_ID" '[.[].check_runs[] | select(.name == $name and .external_id == $ext and (.app.id | tostring) == $app)] | length')
+          test "$existing" = 0
+          pr=$(curl --retry 0 -fsS -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$TARGET_REPO/pulls/$TARGET_PR")
+          jq -e --arg h "$EXPECTED_HEAD" --arg b "$EXPECTED_BASE" --arg r "$TARGET_REPO" '.state == "open" and .head.sha == $h and .base.sha == $b and .head.repo.full_name == $r and .base.repo.full_name == $r' <<<"$pr" >/dev/null
+          jq -n --arg name "$CHECK_NAME" --arg sha "$EXPECTED_HEAD" --arg ext "$EXTERNAL_ID" --arg result "$RESULT" --arg run "$GITHUB_RUN_ID" --arg url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" '{name:$name,head_sha:$sha,status:"completed",conclusion:$result,external_id:$ext,details_url:$url,output:{title:"SA22 L04 frozen-head Go tests",summary:("Test result: " + $result + "; CI run: " + $run)}}' | gh api --method POST "repos/$TARGET_REPO/check-runs" --input - --jq '{id,head_sha,status,conclusion,external_id,html_url}'
